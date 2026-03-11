@@ -41,7 +41,8 @@ res = 0.01
 cmap = ListedColormap(['#f0f0f0', '#e74c3c', '#3498db', '#2ecc71'])
 
 print("\n--- COMANDI TASTIERA ---")
-print("Frecce: Sposta il tronco")
+print("Frecce: Sposta il tronco in piccoli step")
+print("WASD: Sposta il tronco in grandi step")
 print("M: Specchia")
 print("Invio: Chiudi")
 print("------------------------")
@@ -89,6 +90,14 @@ def on_key(event):
         off_x -= step
     elif event.key == 'right':
         off_x += step
+    elif event.key == 'w':
+        off_y += step * 100
+    elif event.key == 'x':
+        off_y -= step * 100
+    elif event.key == 'a':
+        off_x -= step * 100
+    elif event.key == 'd':
+        off_x += step * 100
     elif event.key == 'm':
         mirror *= -1
     elif event.key == 'enter':

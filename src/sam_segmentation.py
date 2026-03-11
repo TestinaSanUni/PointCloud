@@ -48,6 +48,8 @@ def run_sam_classic(image):
     sam = sam_model_registry["vit_h"](checkpoint=checkpoint_path)
     sam.to(device=device)
 
+    # pred_iou_thresh: soglia di confidenza per accettare una maschera. Più è alto, più le maschere saranno "precise" ma rischiano di perdere oggetti.
+    # stability_score_thresh: solidità dei bordi. Più è alto, più le maschere saranno "stabili" ma rischiano di perdere oggetti con bordi sfumati.
     mask_generator = SamAutomaticMaskGenerator(
         model=sam,
         points_per_side=48,
@@ -67,6 +69,8 @@ def run_lang_sam(image):
     model = LangSAM()
     image_pil = Image.fromarray(image).convert("RGB")
 
+    # box_threshold: sensibilità nel trovare i rettangoli (Bounding Boxes). Più è basso, più tronchi trova, ma rischia di includere oggetti non rilevanti.
+    # text_threshold: quanto il prompt dato deve corrispondere all'oggetto trovato.
     text_prompt = "single wood log . single wood stick . single stick . single log"
     results = model.predict([image_pil], [text_prompt], box_threshold=0.25, text_threshold=0.20)
 
