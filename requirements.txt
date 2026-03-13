@@ -6,3 +6,4 @@ torch>=2.4.1
 torchvision>=0.19.1
 segment-anything~=1.0
 matplotlib~=3.10.8
+scikit-learn~=1.8.0

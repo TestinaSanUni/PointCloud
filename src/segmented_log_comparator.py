@@ -1,17 +1,13 @@
 import numpy as np
-import matplotlib
-
-try:
-    matplotlib.use('TkAgg')
-except:
-    pass
-
 import matplotlib.pyplot as plt
-import numpy as np
 import tkinter as tk
 from tkinter import filedialog
 from matplotlib.colors import ListedColormap
+from sklearn.neighbors import NearestNeighbors
 
+#TODO: Automatizzazione
+
+# --- FUNZIONI DI UTILITÀ ---
 def select_file(title):
     root = tk.Tk()
     root.withdraw()
@@ -19,91 +15,130 @@ def select_file(title):
     root.destroy()
     return path
 
-print("Seleziona il file AUTOMATICO...")
-f_auto = select_file("Seleziona AUTOMATICO")
-print("Seleziona il file MANUALE...")
-f_man = select_file("Seleziona MANUALE")
+# --- NORMALIZZAZIONE RIGIDA (PCA + Orientamento) ---
+def rigid_normalization(points):
+    pts = points[:, :2].copy()
+    centroid = np.mean(pts, axis=0)
+    pts -= centroid
+    cov = np.cov(pts.T)
+    evals, evecs = np.linalg.eigh(cov)
+    primary_axis = evecs[:, np.argmax(evals)]
+    angle = np.arctan2(primary_axis[1], primary_axis[0])
+    c, s = np.cos(-angle), np.sin(-angle)
+    R = np.array(((c, -s), (s, c)))
+    return pts @ R.T
 
-if not f_auto or not f_man:
-    print("Selezione annullata.")
-    exit()
+# --- ALLINEAMENTO BOUNDING BOX ---
+def align_bbox_center(A, B):
+    center_A = (A[:, 0].min() + A[:, 0].max()) / 2
+    center_B = (B[:, 0].min() + B[:, 0].max()) / 2
+    shift = center_B - center_A
+    A_aligned = A.copy()
+    A_aligned[:, 0] += shift
+    return A_aligned
 
-# Caricamento e centratura iniziale
-data_a = np.loadtxt(f_auto)[:, :2]
-data_m = np.loadtxt(f_man)[:, :2]
-data_a -= np.mean(data_a, axis=0)
-data_m -= np.mean(data_m, axis=0)
+# --- DOWNSAMPLING PER ICP ---
+def downsample(points, n=15000):
+    if len(points) <= n: return points
+    idx = np.random.choice(len(points), n, replace=False)
+    return points[idx]
 
-# Parametri iniziali
-off_x, off_y = 0.0, 0.0
-mirror = 1
-res = 0.01
-cmap = ListedColormap(['#f0f0f0', '#e74c3c', '#3498db', '#2ecc71'])
+# --- ICP PER MICRO-ALLINEAMENTO ---
+def icp(A, B, max_iterations=40, tolerance=1e-6):
+    src = A.copy()
+    dst = B.copy()
+    prev_error = 0
+    R_final = np.eye(2)
+    t_final = np.zeros(2)
 
-print("\n--- COMANDI TASTIERA ---")
-print("Frecce: Sposta il tronco in piccoli step")
-print("WASD: Sposta il tronco in grandi step")
-print("M: Specchia")
-print("Invio: Chiudi")
-print("------------------------")
+    for i in range(max_iterations):
+        nbrs = NearestNeighbors(n_neighbors=1).fit(dst)
+        distances, indices = nbrs.kneighbors(src)
+        closest = dst[indices[:, 0]]
 
-def render():
-    global off_x, off_y, mirror
-    temp_a = data_a.copy()
-    temp_a[:, 0] *= mirror
-    temp_a[:, 0] += off_x
-    temp_a[:, 1] += off_y
+        centroid_src = np.mean(src, axis=0)
+        centroid_dst = np.mean(closest, axis=0)
 
-    all_pts = np.vstack([temp_a, data_m])
-    x_min, y_min = all_pts.min(axis=0) - 0.05
-    x_max, y_max = all_pts.max(axis=0) + 0.05
+        AA = src - centroid_src
+        BB = closest - centroid_dst
+        H = AA.T @ BB
+        U, S, Vt = np.linalg.svd(H)
+        R = Vt.T @ U.T
+
+        if np.linalg.det(R) < 0:
+            Vt[1, :] *= -1
+            R = Vt.T @ U.T
+
+        t = centroid_dst - R @ centroid_src
+        src = (R @ src.T).T + t
+
+        R_final = R @ R_final
+        t_final = R @ t_final + t
+
+        mean_error = np.mean(distances)
+        if abs(prev_error - mean_error) < tolerance: break
+        prev_error = mean_error
+
+    return src, R_final, t_final
+
+# --- CALCOLO METRICA IoU ---
+def calculate_iou_metric(pts_a, pts_m, res=0.01):
+    all_p = np.vstack([pts_a, pts_m])
+    x_min, y_min = all_p.min(axis=0) - 0.05
+    x_max, y_max = all_p.max(axis=0) + 0.05
     w, h = int((x_max - x_min) / res) + 1, int((y_max - y_min) / res) + 1
-
-    m_a, m_m = np.zeros((h, w), dtype=bool), np.zeros((h, w), dtype=bool)
-    for p, m in [(temp_a, m_a), (data_m, m_m)]:
+    m1, m2 = np.zeros((h, w), dtype=bool), np.zeros((h, w), dtype=bool)
+    for p, mask in [(pts_a, m1), (pts_m, m2)]:
         c = np.clip(((p[:, 0] - x_min) / res).astype(int), 0, w - 1)
         r = np.clip(((p[:, 1] - y_min) / res).astype(int), 0, h - 1)
-        m[r, c] = True
+        mask[r, c] = True
+    union = np.logical_or(m1, m2).sum()
+    return (np.logical_and(m1, m2).sum() / union if union > 0 else 0), m1, m2
 
-    iou = np.logical_and(m_a, m_m).sum() / np.logical_or(m_a, m_m).sum()
-    viz = np.zeros((h, w))
-    viz[m_m] += 1
-    viz[m_a] += 2
+# --- ESECUZIONE ---
+f_auto = select_file("Seleziona AUTOMATICO")
+f_man = select_file("Seleziona MANUALE")
+if not f_auto or not f_man: exit()
 
-    ax.clear()
-    ax.imshow(viz, origin='lower', cmap=cmap)
-    ax.set_title(f"IoU: {iou:.2%}\nFrecce per muovere, 'M' per specchiare, 'Enter' per uscire")
-    ax.axis('off')
-    plt.draw()
+print("Caricamento e Normalizzazione PCA...")
+data_a_raw = np.loadtxt(f_auto)[:, :2]
+data_m_raw = np.loadtxt(f_man)[:, :2]
+data_a_norm = rigid_normalization(data_a_raw)
+data_m_norm = rigid_normalization(data_m_raw)
 
-fig, ax = plt.subplots(figsize=(10, 8))
+print("Ricerca dell'orientamento ottimale...")
+best_iou_global = -1
+final_aligned_a = None
+best_masks = None
 
-# Gestore eventi tastiera
-def on_key(event):
-    global off_x, off_y, mirror
-    step = 0.005
-    if event.key == 'up':
-        off_y += step
-    elif event.key == 'down':
-        off_y -= step
-    elif event.key == 'left':
-        off_x -= step
-    elif event.key == 'right':
-        off_x += step
-    elif event.key == 'w':
-        off_y += step * 100
-    elif event.key == 'x':
-        off_y -= step * 100
-    elif event.key == 'a':
-        off_x -= step * 100
-    elif event.key == 'd':
-        off_x += step * 100
-    elif event.key == 'm':
-        mirror *= -1
-    elif event.key == 'enter':
-        plt.close()
-    render()
+# Test delle 4 possibili simmetrie (Normal, FlipX, FlipY, FlipXY)
+for mx in [1, -1]:
+    for my in [1, -1]:
+        current_test = data_a_norm.copy()
+        current_test[:, 0] *= mx
+        current_test[:, 1] *= my
+        current_test = align_bbox_center(current_test, data_m_norm)
+        a_small = downsample(current_test)
+        m_small = downsample(data_m_norm)
+        _, R, t = icp(a_small, m_small)
+        aligned_full = (R @ current_test.T).T + t
+        iou_tmp, m_a, m_m = calculate_iou_metric(aligned_full, data_m_norm)
+        print(f" > Test [MirrorX: {mx:2}, MirrorY: {my:2}] -> IoU: {iou_tmp:.2%}")
+        if iou_tmp > best_iou_global:
+            best_iou_global = iou_tmp
+            final_aligned_a = aligned_full
+            best_masks = (m_a, m_m)
 
-fig.canvas.mpl_connect('key_press_event', on_key)
-render()
+# --- VISUALIZZAZIONE FINALE ---
+mask_a, mask_m = best_masks
+cmap = ListedColormap(['#f0f0f0', '#e74c3c', '#3498db', '#2ecc71'])
+viz = np.zeros(mask_a.shape)
+viz[mask_m] += 1
+viz[mask_a] += 2
+
+plt.figure(figsize=(10, 8))
+plt.imshow(viz, origin='lower', cmap=cmap)
+plt.title(f"VALIDAZIONE METRICA FINALE\nIoU Ottimizzato: {best_iou_global:.2%}")
+plt.axis('off')
+print(f"\nAllineamento completato. Miglior IoU: {best_iou_global:.4f}")
 plt.show()

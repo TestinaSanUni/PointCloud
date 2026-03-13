@@ -5,6 +5,7 @@ import os
 import glob
 import sys
 import argparse
+import csv
 from segment_anything import sam_model_registry, SamAutomaticMaskGenerator
 import warnings
 
@@ -35,6 +36,8 @@ for f in glob.glob(os.path.join(data_dir, "tronco_*")):
 print(f"Caricamento dati per modalità: {args.mode}...")
 image_np = np.load(os.path.join(data_dir, "color_data.npy"))
 depth_array = np.load(os.path.join(data_dir, "depth_data.npy"))
+# kernel = np.ones((3, 3), np.uint8)
+# depth_array = cv2.dilate(depth_array, kernel, iterations=1)
 params = np.load(os.path.join(data_dir, "camera_params.npz"))
 intrinsic = params['intrinsic']
 fx, fy = intrinsic[0, 0], intrinsic[1, 1]
@@ -48,8 +51,6 @@ def run_sam_classic(image):
     sam = sam_model_registry["vit_h"](checkpoint=checkpoint_path)
     sam.to(device=device)
 
-    # pred_iou_thresh: soglia di confidenza per accettare una maschera. Più è alto, più le maschere saranno "precise" ma rischiano di perdere oggetti.
-    # stability_score_thresh: solidità dei bordi. Più è alto, più le maschere saranno "stabili" ma rischiano di perdere oggetti con bordi sfumati.
     mask_generator = SamAutomaticMaskGenerator(
         model=sam,
         points_per_side=48,
@@ -69,14 +70,13 @@ def run_lang_sam(image):
     model = LangSAM()
     image_pil = Image.fromarray(image).convert("RGB")
 
-    # box_threshold: sensibilità nel trovare i rettangoli (Bounding Boxes). Più è basso, più tronchi trova, ma rischia di includere oggetti non rilevanti.
-    # text_threshold: quanto il prompt dato deve corrispondere all'oggetto trovato.
     text_prompt = "single wood log . single wood stick . single stick . single log"
     results = model.predict([image_pil], [text_prompt], box_threshold=0.25, text_threshold=0.20)
 
     formatted_masks = []
     masks_data = results[0]['masks']
     boxes_data = results[0]['boxes']
+    scores_data = results[0]['scores']
     num_masks = masks_data.shape[0] if hasattr(masks_data, 'shape') else len(masks_data)
 
     for i in range(num_masks):
@@ -86,10 +86,14 @@ def run_lang_sam(image):
         b = boxes_data[i]
         if hasattr(b, 'cpu'): b = b.cpu().numpy()
 
+        s = scores_data[i]
+        if hasattr(s, 'item'): s = s.item()
+
         formatted_masks.append({
             'segmentation': m.astype(bool),
             'area': np.sum(m),
-            'bbox': [b[0], b[1], b[2] - b[0], b[3] - b[1]]
+            'bbox': [b[0], b[1], b[2] - b[0], b[3] - b[1]],
+            'score': s
         })
     return formatted_masks
 
@@ -108,6 +112,7 @@ min_area_consentita = (h * w) * 0.0010
 
 overlay_all = image_np.copy()
 count_tronchi = 0
+report_score = []
 masks = sorted(masks, key=(lambda x: x['area']))
 
 for i, mask_data in enumerate(masks):
@@ -115,9 +120,14 @@ for i, mask_data in enumerate(masks):
     area = mask_data['area']
     bbox = mask_data['bbox']
 
+    # Recupero score in base al modello usato
+    if args.mode == "SAM_CLASSIC":
+        score = mask_data.get('predicted_iou', 0.0)
+    else:
+        score = mask_data.get('score', 0.0)
+
     # Filtri geometrici (Area e Profondità)
     if area > max_area_consentita or area < min_area_consentita:
-        print(f"DEBUG: Tronco scartato per area non consentita ({area} px)")
         continue
 
     v, u = np.where(mask > 0)
@@ -126,7 +136,6 @@ for i, mask_data in enumerate(masks):
 
     # Filtro di validità dei punti 3D
     if np.sum(valid) < 800:
-        print("DEBUG: Tronco scartato per pochi punti validi")
         continue
 
     z_valid = z[valid]
@@ -136,17 +145,19 @@ for i, mask_data in enumerate(masks):
     # Filtro di spessore
     if args.mode == "SAM_CLASSIC":
         if z_range < 0.10 or z_std < 0.04:
-            print("DEBUG: Tronco scartato per spessore")
             continue
 
     # Filtro Colore (Luminosità)
     pixel_valori = image_np[mask]
     if np.mean(pixel_valori) < 80 and args.mode == "SAM_CLASSIC":
-        print(f"DEBUG: Tronco scartato per luminosità troppo bassa (mean={np.mean(pixel_valori):.2f}))")
         continue
 
     count_tronchi += 1
-    print("DEBUG: tronco", count_tronchi, "area:", area, "z_range:", z_range, "z_std:", z_std, "luminosità:", np.mean(pixel_valori))
+
+    # Aggiunta dati al report
+    report_score.append({'id': count_tronchi, 'score': round(float(score), 4)})
+
+    print(f"DEBUG: tronco {count_tronchi} | area: {area} | score: {score:.4f}")
 
     # Back-projection XYZ
     x_3d = (u[valid] - cx) * z_valid / fx
@@ -167,8 +178,17 @@ for i, mask_data in enumerate(masks):
 
         color = np.random.randint(0, 255, (3,)).tolist()
         cv2.drawContours(overlay_all, contours, -1, color, 3)
-        cv2.putText(overlay_all, f"ID:{count_tronchi}", (int(u.mean()), int(v.mean())),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, color, 3)
+        # Ho aggiunto lo score anche sulla preview visiva per comodità
+        cv2.putText(overlay_all, f"ID:{count_tronchi} (S:{score:.2f})", (int(u.mean()), int(v.mean())),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+
+# --- SCRITTURA FILE CSV ---
+csv_path = os.path.join(data_dir, "tronchi_score.csv")
+with open(csv_path, mode='w', newline='') as f:
+    writer = csv.DictWriter(f, fieldnames=['id', 'score'])
+    writer.writeheader()
+    writer.writerows(report_score)
 
 cv2.imwrite(os.path.join(data_dir, "mask_check_all.png"), cv2.cvtColor(overlay_all, cv2.COLOR_RGB2BGR))
 print(f"Terminato. Metodo: {args.mode}. Estratti {count_tronchi} tronchi.")
+print(f"Report score salvato in: {csv_path}")

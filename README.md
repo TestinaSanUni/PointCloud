@@ -20,7 +20,7 @@ Il progetto è composto dai seguenti moduli funzionali:
 
 **File secondari di controllo manuale**
 * **`manual_validation_tool.py`**: Interfaccia interattiva per effettuare misure manuali su file XYZ.
-* **`segmented_log_comparator.py`**: Algoritmo di calcolo IoU (Intersection over Union) per la validazione delle maschere tramite allineamento manuale di file XYZ.
+* **`segmented_log_comparator.py`**: [MODIFICA IN CORSO] Algoritmo di calcolo IoU (Intersection over Union) per la validazione delle maschere tramite allineamento manuale di file XYZ.
 * **`las_viewer.py`**: Utility per la visualizzazione 3D delle nuvole di punti LAS.
 
 ## Modelli Pre-addestrati
@@ -46,4 +46,5 @@ Le dipendenze necessarie sono elencate nel file `requirements.txt`. Per l'instal
 * `torchvision>=0.19.1`
 * `segment-anything~=1.0`
 * `matplotlib~=3.10.8`
+* `scikit-learn~=1.8.0`
 
