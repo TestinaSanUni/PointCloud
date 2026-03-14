@@ -48,17 +48,35 @@ cx, cy = intrinsic[0, 2], intrinsic[1, 2]
 def run_sam_classic(image):
     print("Inizializzazione SAM Classic (Automatic Mask Generator)...")
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    sam = sam_model_registry["vit_h"](checkpoint=checkpoint_path)
-    sam.to(device=device)
+    try:
+        sam = sam_model_registry["vit_h"](checkpoint=checkpoint_path)
+        sam.to(device=device)
 
-    mask_generator = SamAutomaticMaskGenerator(
-        model=sam,
-        points_per_side=48,
-        pred_iou_thresh=0.92,
-        stability_score_thresh=0.92,
-        min_mask_region_area=1800
-    )
-    return mask_generator.generate(image)
+        mask_generator = SamAutomaticMaskGenerator(
+            model=sam,
+            points_per_side=48,
+            pred_iou_thresh=0.92,
+            stability_score_thresh=0.92,
+            min_mask_region_area=1800
+        )
+
+        return mask_generator.generate(image)
+
+    except RuntimeError as e:
+        if "indices" in str(e) or "CUDA" in str(e):
+            print(f"ATTENZIONE: Errore GPU sul file corrente. Switch su CPU in corso...")
+            sam = sam_model_registry["vit_h"](checkpoint=checkpoint_path)
+            sam.to(device="cpu")
+            mask_generator = SamAutomaticMaskGenerator(
+                model=sam,
+                points_per_side=48,
+                pred_iou_thresh=0.92,
+                stability_score_thresh=0.92,
+                min_mask_region_area=1800
+            )
+            return mask_generator.generate(image)
+        else:
+            raise e
 
 
 # --- MODELLO 2: LANG-SAM ---
@@ -178,8 +196,7 @@ for i, mask_data in enumerate(masks):
 
         color = np.random.randint(0, 255, (3,)).tolist()
         cv2.drawContours(overlay_all, contours, -1, color, 3)
-        # Ho aggiunto lo score anche sulla preview visiva per comodità
-        cv2.putText(overlay_all, f"ID:{count_tronchi} (S:{score:.2f})", (int(u.mean()), int(v.mean())),
+        cv2.putText(overlay_all, f"ID:{count_tronchi}", (int(u.mean()), int(v.mean())),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
 
 # --- SCRITTURA FILE CSV ---

@@ -4,8 +4,9 @@ import tkinter as tk
 from tkinter import filedialog
 from matplotlib.colors import ListedColormap
 from sklearn.neighbors import NearestNeighbors
+import time
 
-#TODO: Automatizzazione
+#TODO: Automaticamente identificare e calcolare IoU dei tronchi di un certo file
 
 # --- FUNZIONI DI UTILITÀ ---
 def select_file(title):
@@ -15,7 +16,6 @@ def select_file(title):
     root.destroy()
     return path
 
-# --- NORMALIZZAZIONE RIGIDA (PCA + Orientamento) ---
 def rigid_normalization(points):
     pts = points[:, :2].copy()
     centroid = np.mean(pts, axis=0)
@@ -28,32 +28,22 @@ def rigid_normalization(points):
     R = np.array(((c, -s), (s, c)))
     return pts @ R.T
 
-# --- ALLINEAMENTO BOUNDING BOX ---
-def align_bbox_center(A, B):
-    center_A = (A[:, 0].min() + A[:, 0].max()) / 2
-    center_B = (B[:, 0].min() + B[:, 0].max()) / 2
-    shift = center_B - center_A
-    A_aligned = A.copy()
-    A_aligned[:, 0] += shift
-    return A_aligned
-
-# --- DOWNSAMPLING PER ICP ---
-def downsample(points, n=15000):
+def downsample(points, n=10000):
     if len(points) <= n: return points
     idx = np.random.choice(len(points), n, replace=False)
     return points[idx]
 
-# --- ICP PER MICRO-ALLINEAMENTO ---
-def icp(A, B, max_iterations=40, tolerance=1e-6):
+# --- ICP OTTIMIZZATO ---
+def icp_optimized(A, B, nbrs_model, max_iterations=16, tolerance=1e-6):
     src = A.copy()
     dst = B.copy()
+
     prev_error = 0
     R_final = np.eye(2)
     t_final = np.zeros(2)
 
     for i in range(max_iterations):
-        nbrs = NearestNeighbors(n_neighbors=1).fit(dst)
-        distances, indices = nbrs.kneighbors(src)
+        distances, indices = nbrs_model.kneighbors(src)
         closest = dst[indices[:, 0]]
 
         centroid_src = np.mean(src, axis=0)
@@ -81,7 +71,6 @@ def icp(A, B, max_iterations=40, tolerance=1e-6):
 
     return src, R_final, t_final
 
-# --- CALCOLO METRICA IoU ---
 def calculate_iou_metric(pts_a, pts_m, res=0.01):
     all_p = np.vstack([pts_a, pts_m])
     x_min, y_min = all_p.min(axis=0) - 0.05
@@ -100,34 +89,56 @@ f_auto = select_file("Seleziona AUTOMATICO")
 f_man = select_file("Seleziona MANUALE")
 if not f_auto or not f_man: exit()
 
-print("Caricamento e Normalizzazione PCA...")
+start_time = time.time()
+
+print("Caricamento...")
 data_a_raw = np.loadtxt(f_auto)[:, :2]
 data_m_raw = np.loadtxt(f_man)[:, :2]
 data_a_norm = rigid_normalization(data_a_raw)
 data_m_norm = rigid_normalization(data_m_raw)
-
-print("Ricerca dell'orientamento ottimale...")
+nbrs_manual = NearestNeighbors(n_neighbors=1, algorithm='kd_tree').fit(data_m_norm)
 best_iou_global = -1
 final_aligned_a = None
 best_masks = None
 
-# Test delle 4 possibili simmetrie (Normal, FlipX, FlipY, FlipXY)
+print("Ricerca dell'orientamento ottimale...")
 for mx in [1, -1]:
     for my in [1, -1]:
-        current_test = data_a_norm.copy()
-        current_test[:, 0] *= mx
-        current_test[:, 1] *= my
-        current_test = align_bbox_center(current_test, data_m_norm)
-        a_small = downsample(current_test)
-        m_small = downsample(data_m_norm)
-        _, R, t = icp(a_small, m_small)
-        aligned_full = (R @ current_test.T).T + t
-        iou_tmp, m_a, m_m = calculate_iou_metric(aligned_full, data_m_norm)
-        print(f" > Test [MirrorX: {mx:2}, MirrorY: {my:2}] -> IoU: {iou_tmp:.2%}")
-        if iou_tmp > best_iou_global:
-            best_iou_global = iou_tmp
-            final_aligned_a = aligned_full
-            best_masks = (m_a, m_m)
+        # Simmetria
+        current_flip = data_a_norm.copy()
+        current_flip[:, 0] *= mx
+        current_flip[:, 1] *= my
+
+        # Test delle 3 posizioni di partenza per evitare massimi locali
+        for align_mode in ['left', 'center', 'right']:
+            current_test = current_flip.copy()
+
+            if align_mode == 'left':
+                shift = data_m_norm[:, 0].min() - current_test[:, 0].min()
+            elif align_mode == 'right':
+                shift = data_m_norm[:, 0].max() - current_test[:, 0].max()
+            else:
+                shift = ((data_m_norm[:, 0].min() + data_m_norm[:, 0].max()) / 2) - \
+                        ((current_test[:, 0].min() + current_test[:, 0].max()) / 2)
+
+            current_test[:, 0] += shift
+
+            # Downsample per velocizzare l'ICP
+            a_small = downsample(current_test, n=5000)
+
+            _, R, t = icp_optimized(a_small, data_m_norm, nbrs_manual)
+            aligned_full = (R @ current_test.T).T + t
+            iou_tmp, m_a, m_m = calculate_iou_metric(aligned_full, data_m_norm)
+            print(f" > [Flip: {mx},{my} | Pos: {align_mode:7}] -> IoU: {iou_tmp:.2%}")
+
+            if iou_tmp > best_iou_global:
+                best_iou_global = iou_tmp
+                final_aligned_a = aligned_full
+                best_masks = (m_a, m_m)
+
+end_time = time.time()
+print(f"\nAllineamento completato in {end_time - start_time:.2f} secondi.")
+print(f"Miglior IoU trovato: {best_iou_global:.4f}")
 
 # --- VISUALIZZAZIONE FINALE ---
 mask_a, mask_m = best_masks
@@ -138,7 +149,6 @@ viz[mask_a] += 2
 
 plt.figure(figsize=(10, 8))
 plt.imshow(viz, origin='lower', cmap=cmap)
-plt.title(f"VALIDAZIONE METRICA FINALE\nIoU Ottimizzato: {best_iou_global:.2%}")
+plt.title(f"VALIDAZIONE FINALE\nIoU: {best_iou_global:.2%}")
 plt.axis('off')
-print(f"\nAllineamento completato. Miglior IoU: {best_iou_global:.4f}")
 plt.show()
