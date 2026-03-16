@@ -1,6 +1,7 @@
 import numpy as np
 import cv2
 import torch
+import open3d as o3d
 import os
 import glob
 import sys
@@ -10,6 +11,7 @@ from segment_anything import sam_model_registry, SamAutomaticMaskGenerator
 import warnings
 
 warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
 
 # --- GESTIONE ARGOMENTI ---
 parser = argparse.ArgumentParser()
@@ -23,7 +25,8 @@ data_dir = os.path.abspath(os.path.join(base_dir, "..", "data"))
 model_dir = os.path.abspath(os.path.join(base_dir, "..", "model"))
 checkpoint_path = os.path.join(model_dir, "sam_vit_h_4b8939.pth")
 
-if not os.path.exists(data_dir): os.makedirs(data_dir)
+if not os.path.exists(data_dir):
+    os.makedirs(data_dir)
 
 # Pulizia file precedenti
 for f in glob.glob(os.path.join(data_dir, "tronco_*")):
@@ -34,14 +37,71 @@ for f in glob.glob(os.path.join(data_dir, "tronco_*")):
 
 # --- CARICAMENTO DATI COMUNI ---
 print(f"Caricamento dati per modalità: {args.mode}...")
+
+# Caricamento della nuvola di punti originale
+print("Caricamento nuvola di punti originale...")
+try:
+    import laspy
+
+    las = laspy.read(args.las_path)
+    points_original = np.vstack((las.x, las.y, las.z)).transpose()
+except Exception as e:
+    print(f"ERRORE durante la lettura del file LAS: {e}")
+    sys.exit(1)
+
+# Caricamento dell'offset applicato durante la generazione della vista
+offset = np.load(os.path.join(data_dir, "offset.npy"))
+print(f"Offset caricato: {offset}")
+
+# Caricamento dei dati della camera
 image_np = np.load(os.path.join(data_dir, "color_data.npy"))
-depth_array = np.load(os.path.join(data_dir, "depth_data.npy"))
-# kernel = np.ones((3, 3), np.uint8)
-# depth_array = cv2.dilate(depth_array, kernel, iterations=1)
 params = np.load(os.path.join(data_dir, "camera_params.npz"))
 intrinsic = params['intrinsic']
+extrinsic = params['extrinsic']
 fx, fy = intrinsic[0, 0], intrinsic[1, 1]
 cx, cy = intrinsic[0, 2], intrinsic[1, 2]
+
+h, w, _ = image_np.shape
+print(f"Immagine caricata: {w}x{h}")
+
+# --- PREPARAZIONE NUVOLA PER PROIEZIONE ---
+print("Preparazione nuvola per proiezione...")
+points_centered = points_original - offset
+pcd = o3d.geometry.PointCloud()
+pcd.points = o3d.utility.Vector3dVector(points_centered)
+
+# Costruzione della matrice di proiezione della camera
+proj_matrix = intrinsic @ extrinsic[:3, :]
+
+# Pre-calcolo delle coordinate dei punti nello spazio immagine
+print("Proiezione punti nello spazio immagine...")
+points_homo = np.hstack([points_centered, np.ones((len(points_centered), 1))])
+points_camera = (extrinsic @ points_homo.T).T
+points_camera = points_camera[:, :3]
+
+# Proiezione dei punti sull'immagine (Z > 0)
+valid_camera = points_camera[:, 2] > 0
+points_camera_valid = points_camera[valid_camera]
+
+x_proj = (points_camera_valid[:, 0] * fx / points_camera_valid[:, 2]) + cx
+y_proj = (points_camera_valid[:, 1] * fy / points_camera_valid[:, 2]) + cy
+
+# Creazione della mappa pixel - punti
+print("Costruzione mappa pixel -> punti 3D...")
+pixel_to_points = {}
+x_int = np.round(x_proj).astype(int)
+y_int = np.round(y_proj).astype(int)
+in_image = (x_int >= 0) & (x_int < w) & (y_int >= 0) & (y_int < h)
+x_int = x_int[in_image]
+y_int = y_int[in_image]
+indici_originali = np.where(valid_camera)[0][in_image]
+for idx_pixel, (x, y, idx_point) in enumerate(zip(x_int, y_int, indici_originali)):
+    key = (x, y)
+    if key not in pixel_to_points:
+        pixel_to_points[key] = []
+    pixel_to_points[key].append(idx_point)
+
+print(f"Mappa creata: {len(pixel_to_points)} pixel coperti da {len(indici_originali)} punti")
 
 
 # --- MODELLO 1: SAM CLASSIC ---
@@ -122,9 +182,8 @@ if args.mode == "SAM_CLASSIC":
 else:
     masks = run_lang_sam(image_np)
 
-# --- LOGICA DI FILTRAGGIO E ESTRAZIONE ---
+# --- LOGICA DI FILTRAGGIO, ESTRAZIONE E PROIEZIONE ---
 print(f"Elaborazione maschere e riproiezione 3D...")
-h, w, _ = image_np.shape
 max_area_consentita = (h * w) * 0.10
 min_area_consentita = (h * w) * 0.0010
 
@@ -136,7 +195,6 @@ masks = sorted(masks, key=(lambda x: x['area']))
 for i, mask_data in enumerate(masks):
     mask = mask_data['segmentation']
     area = mask_data['area']
-    bbox = mask_data['bbox']
 
     # Recupero score in base al modello usato
     if args.mode == "SAM_CLASSIC":
@@ -144,44 +202,63 @@ for i, mask_data in enumerate(masks):
     else:
         score = mask_data.get('score', 0.0)
 
-    # Filtri geometrici (Area e Profondità)
+    # Filtro area
     if area > max_area_consentita or area < min_area_consentita:
         continue
 
     v, u = np.where(mask > 0)
-    z = depth_array[v, u]
-    valid = z > 0.001
 
-    # Filtro di validità dei punti 3D
-    if np.sum(valid) < 800:
+    # Individuazione degli indici dei punti 3D che cadono in questi pixel
+    punti_indices = []
+    punti_profondita = []
+
+    for u_pix, v_pix in zip(u, v):
+        key = (u_pix, v_pix)
+        if key in pixel_to_points:
+            for idx_punto in pixel_to_points[key]:
+                punti_indices.append(idx_punto)
+                punti_profondita.append(points_camera[idx_punto, 2])
+
+    punti_indices = np.array(punti_indices)
+    punti_profondita = np.array(punti_profondita)
+
+    # Filtro di unicità punti
+    if len(np.unique(punti_indices)) < 10:
         continue
 
-    z_valid = z[valid]
-    z_range = np.max(z_valid) - np.min(z_valid)
-    z_std = np.std(z_valid)
+    # Calcolo delle metriche di profondità
+    if len(punti_profondita) > 0:
+        z_range = np.max(punti_profondita) - np.min(punti_profondita)
+        z_std = np.std(punti_profondita)
+        z_media = np.mean(punti_profondita)
+    else:
+        continue
 
-    # Filtro di spessore
+    # Filtro di spessore (adattivo basato sulla distanza)
+    soglia_range = max(0.05, z_media * 0.02)
     if args.mode == "SAM_CLASSIC":
-        if z_range < 0.10 or z_std < 0.04:
+        if z_range < soglia_range or z_std < 0.02:
             continue
 
-    # Filtro Colore (Luminosità)
+    # Filtro di colore
     pixel_valori = image_np[mask]
     if np.mean(pixel_valori) < 80 and args.mode == "SAM_CLASSIC":
         continue
+
+    # Maschera valida
+    punti_unici = np.unique(punti_indices)
+    points_3d_centered = points_centered[punti_unici]
+    points_3d_original = points_3d_centered + offset
 
     count_tronchi += 1
 
     # Aggiunta dati al report
     report_score.append({'id': count_tronchi, 'score': round(float(score), 4)})
 
-    print(f"DEBUG: tronco {count_tronchi} | area: {area} | score: {score:.4f}")
+    print(f"DEBUG: tronco {count_tronchi} | area: {area} | punti: {len(points_3d_original)} | z_media: {z_media:.2f}m")
 
-    # Back-projection XYZ
-    x_3d = (u[valid] - cx) * z_valid / fx
-    y_3d = (v[valid] - cy) * z_valid / fy
-    points_3d = np.stack([x_3d, y_3d, z_valid], axis=1)
-    np.savetxt(os.path.join(data_dir, f"tronco_{count_tronchi}.xyz"), points_3d)
+    # Salvataggio tronco
+    np.savetxt(os.path.join(data_dir, f"tronco_{count_tronchi}.xyz"), points_3d_original)
 
     # Preview ritagliata
     contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -202,9 +279,10 @@ for i, mask_data in enumerate(masks):
 # --- SCRITTURA FILE CSV ---
 csv_path = os.path.join(data_dir, "tronchi_score.csv")
 with open(csv_path, mode='w', newline='') as f:
-    writer = csv.DictWriter(f, fieldnames=['id', 'score'])
+    writer = csv.DictWriter(f, fieldnames=['id', 'score'], delimiter=';')
     writer.writeheader()
-    writer.writerows(report_score)
+    for item in report_score:
+        writer.writerow(item)
 
 cv2.imwrite(os.path.join(data_dir, "mask_check_all.png"), cv2.cvtColor(overlay_all, cv2.COLOR_RGB2BGR))
 print(f"Terminato. Metodo: {args.mode}. Estratti {count_tronchi} tronchi.")
