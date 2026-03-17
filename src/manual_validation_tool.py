@@ -16,6 +16,31 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 data_dir = os.path.abspath(os.path.join(current_dir, "..", "data"))
 output_csv = os.path.join(data_dir, "validazione_manuale.csv")
 
+# --- PARAMETRI DI RIDUZIONE ---
+TOP_PERCENT = 0.65  # Percentuale superiore del tronco
+MAX_POINTS = 5000  # Numero massimo di punti da visualizzare
+
+def downsample_cloud(points, top_percent=TOP_PERCENT, max_points=MAX_POINTS):
+    if len(points) == 0:
+        return points
+
+    # Filtro Z
+    z_min = np.min(points[:, 2])
+    z_max = np.max(points[:, 2])
+    z_range = z_max - z_min
+    soglia_z = z_max - (z_range * top_percent)
+    mask_z = points[:, 2] >= soglia_z
+    points_filtrati = points[mask_z]
+
+    # Downsample
+    if len(points_filtrati) > max_points:
+        idx = np.random.choice(len(points_filtrati), max_points, replace=False)
+        points_finali = points_filtrati[idx]
+    else:
+        points_finali = points_filtrati
+
+    return points_finali
+
 # Lettura di tutti i file .xyz
 files = sorted(glob.glob(os.path.join(data_dir, "tronco_*.xyz")))
 
@@ -44,7 +69,9 @@ for f in files:
 
     if points.size == 0: continue
 
-    x, y = points[:, 0], points[:, 1]
+    # Riduzione della nuvola per visualizzazione
+    points_ridotti = downsample_cloud(points, TOP_PERCENT, MAX_POINTS)
+    x, y = points_ridotti[:, 0], points_ridotti[:, 1]
 
     fig, ax = plt.subplots(figsize=(10, 8))
     ax.scatter(x, y, s=2, c='black', alpha=0.4)
