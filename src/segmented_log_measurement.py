@@ -1,3 +1,8 @@
+# (4)
+# applica i filtri alle maschere ottenute tramite il modello
+# esegue le misurazioni
+#
+
 import numpy as np
 import os
 import glob

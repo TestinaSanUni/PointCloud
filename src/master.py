@@ -1,3 +1,7 @@
+# (1)
+# gestisce la pipeline
+#
+
 import os
 import sys
 import subprocess

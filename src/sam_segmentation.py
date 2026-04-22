@@ -1,3 +1,7 @@
+# (3)
+# applica il modello SAM o Lang SAM
+#
+
 import numpy as np
 import cv2
 import torch
@@ -112,11 +116,12 @@ def run_sam_classic(image):
         sam = sam_model_registry["vit_h"](checkpoint=checkpoint_path)
         sam.to(device=device)
 
+        # FIXME: valori di partenza 48, 0.92, 0.92, 1800
         mask_generator = SamAutomaticMaskGenerator(
             model=sam,
             points_per_side=48,
-            pred_iou_thresh=0.92,
-            stability_score_thresh=0.92,
+            pred_iou_thresh=0.90,
+            stability_score_thresh=0.90,
             min_mask_region_area=1800
         )
 
@@ -124,14 +129,14 @@ def run_sam_classic(image):
 
     except RuntimeError as e:
         if "indices" in str(e) or "CUDA" in str(e):
-            print(f"ATTENZIONE: Errore GPU sul file corrente. Switch su CPU in corso...")
+            print(f"\033[31mATTENZIONE: Errore GPU sul file corrente. Switch su CPU in corso...\033[0m")
             sam = sam_model_registry["vit_h"](checkpoint=checkpoint_path)
             sam.to(device="cpu")
             mask_generator = SamAutomaticMaskGenerator(
                 model=sam,
                 points_per_side=48,
-                pred_iou_thresh=0.92,
-                stability_score_thresh=0.92,
+                pred_iou_thresh=0.90,
+                stability_score_thresh=0.90,
                 min_mask_region_area=1800
             )
             return mask_generator.generate(image)
@@ -149,7 +154,7 @@ def run_lang_sam(image):
     image_pil = Image.fromarray(image).convert("RGB")
 
     text_prompt = "single wood log . single wood stick . single stick . single log"
-    results = model.predict([image_pil], [text_prompt], box_threshold=0.25, text_threshold=0.20)
+    results = model.predict([image_pil], [text_prompt], box_threshold=0.20, text_threshold=0.20) # FIXME: valori originali box_threshold=0.25, text_threshold=0.20
 
     formatted_masks = []
     masks_data = results[0]['masks']
@@ -184,27 +189,40 @@ else:
 
 # --- LOGICA DI FILTRAGGIO, ESTRAZIONE E PROIEZIONE ---
 print(f"Elaborazione maschere e riproiezione 3D...")
-max_area_consentita = (h * w) * 0.10
-min_area_consentita = (h * w) * 0.0010
+# FIXME: valori iniziali 0.10 e 0.0010
+max_area_consentita = (h * w) * 0.05
+min_area_consentita = (h * w) * 0.002
 
 overlay_all = image_np.copy()
 count_tronchi = 0
 report_score = []
-masks = sorted(masks, key=(lambda x: x['area']))
+
+# ordina le maschere in base alla confidenza
+if args.mode == "SAM_CLASSIC":
+    masks = sorted(masks, key=(lambda x: x['predicted_iou']), reverse=True)
+else:
+    masks = sorted(masks, key=(lambda x: x['score']), reverse=True)
+
+canvas_occupato = np.zeros((h, w), dtype=bool)
 
 for i, mask_data in enumerate(masks):
     mask = mask_data['segmentation']
     area = mask_data['area']
+
+    # Filtro area
+    if area > max_area_consentita or area < min_area_consentita:
+        continue
+
+    # controlla la sovrapposizione tra le maschere -> tiene quella a confidenza maggiore
+    sovrapposizione = np.logical_and(canvas_occupato, mask).sum() / area
+    if sovrapposizione > 0.25:
+        continue
 
     # Recupero score in base al modello usato
     if args.mode == "SAM_CLASSIC":
         score = mask_data.get('predicted_iou', 0.0)
     else:
         score = mask_data.get('score', 0.0)
-
-    # Filtro area
-    if area > max_area_consentita or area < min_area_consentita:
-        continue
 
     v, u = np.where(mask > 0)
 
@@ -235,7 +253,7 @@ for i, mask_data in enumerate(masks):
         continue
 
     # Filtro di spessore (adattivo basato sulla distanza)
-    soglia_range = max(0.05, z_media * 0.02)
+    soglia_range = max(0.05, z_media * 0.02) # FIXME: valore originale max(0.05, z_media * 0.02)
     if args.mode == "SAM_CLASSIC":
         if z_range < soglia_range or z_std < 0.02:
             continue
@@ -251,6 +269,8 @@ for i, mask_data in enumerate(masks):
     points_3d_original = points_3d_centered + offset
 
     count_tronchi += 1
+
+    canvas_occupato = np.logical_or(canvas_occupato, mask)
 
     # Aggiunta dati al report
     report_score.append({'id': count_tronchi, 'score': round(float(score), 4)})

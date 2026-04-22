@@ -1,3 +1,7 @@
+# (2)
+#
+#
+
 import matplotlib.pyplot as plt
 import open3d as o3d
 import numpy as np
@@ -52,7 +56,8 @@ else:  # LANG_SAM
     z_ground = np.percentile(z_values, 2)
 
     # Maschera per il pavimento (con background subtraction)
-    floor_mask = z_values < (z_ground + 0.28)
+    # FIXME: valore originale 0.28
+    floor_mask = z_values < (z_ground + 0.05)
 
     try:
         if hasattr(las, 'red'):
@@ -82,13 +87,14 @@ vis.add_geometry(pcd)
 
 # --- CONFIGURAZIONE RENDERING ---
 render_option = vis.get_render_option()
-render_option.point_size = 2.5
 render_option.background_color = np.array([0, 0, 0])
 
 # --- POSIZIONAMENTO CAMERA ---
 ctr = vis.get_view_control()
 bbox = pcd.get_axis_aligned_bounding_box()
 center = bbox.get_center()
+
+render_option.point_size = max(0.5, 20.0 / max(bbox.get_extent())) # FIXME: valore iniziale 2.5
 
 ctr.set_front([0, 0, 1])
 ctr.set_lookat(center)
