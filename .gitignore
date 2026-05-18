@@ -2,3 +2,5 @@ data/
 venv/
 .idea/
 *.pth
+model/
+venvPC/

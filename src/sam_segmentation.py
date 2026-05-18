@@ -49,6 +49,17 @@ try:
 
     las = laspy.read(args.las_path)
     points_original = np.vstack((las.x, las.y, las.z)).transpose()
+    
+    # Estrazione colori originali
+    if hasattr(las, 'red'):
+        print("Colori originali trovati nel file LAS.")
+        r = np.array(las.red) / 65535.0
+        g = np.array(las.green) / 65535.0
+        b = np.array(las.blue) / 65535.0
+        colors_original = np.vstack((r, g, b)).transpose()
+    else:
+        print("ATTENZIONE: Colori RGB non trovati nel LAS. Utilizzo bianco di default.")
+        colors_original = np.ones((len(points_original), 3))
 except Exception as e:
     print(f"ERRORE durante la lettura del file LAS: {e}")
     sys.exit(1)
@@ -196,6 +207,7 @@ min_area_consentita = (h * w) * 0.002
 overlay_all = image_np.copy()
 count_tronchi = 0
 report_score = []
+all_logs_pcd = [] # Lista per la nuvola finale combinata
 
 # ordina le maschere in base alla confidenza
 if args.mode == "SAM_CLASSIC":
@@ -280,6 +292,13 @@ for i, mask_data in enumerate(masks):
     # Salvataggio tronco
     np.savetxt(os.path.join(data_dir, f"tronco_{count_tronchi}.xyz"), points_3d_original)
 
+    # Salvataggio tronco in formato .ply con colori originali
+    log_pcd = o3d.geometry.PointCloud()
+    log_pcd.points = o3d.utility.Vector3dVector(points_3d_original)
+    log_pcd.colors = o3d.utility.Vector3dVector(colors_original[punti_unici])
+    o3d.io.write_point_cloud(os.path.join(data_dir, f"tronco_{count_tronchi}.ply"), log_pcd)
+    all_logs_pcd.append(log_pcd)
+
     # Preview ritagliata
     contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if len(contours) > 0:
@@ -305,5 +324,15 @@ with open(csv_path, mode='w', newline='') as f:
         writer.writerow(item)
 
 cv2.imwrite(os.path.join(data_dir, "mask_check_all.png"), cv2.cvtColor(overlay_all, cv2.COLOR_RGB2BGR))
+
+# Salvataggio nuvola combinata di tutti i tronchi
+if all_logs_pcd:
+    combined_pcd = o3d.geometry.PointCloud()
+    for p in all_logs_pcd:
+        combined_pcd += p
+    combined_pcd_path = os.path.join(data_dir, "segmented_cloud_all.ply")
+    o3d.io.write_point_cloud(combined_pcd_path, combined_pcd)
+    print(f"Nuvola combinata salvata: {combined_pcd_path}")
+
 print(f"Terminato. Metodo: {args.mode}. Estratti {count_tronchi} tronchi.")
 print(f"Report score salvato in: {csv_path}")
